@@ -918,6 +918,23 @@ class DSpaceClient:
 
         return dso_type(api_resource=parse_json(r))
 
+    def map_collection(self, item_uuid=None, collection_uuid=None):
+        """
+        Map an item to a collection
+        @param item_uuid: item to map
+        @param collection_uuid: new parent collection
+        @return: True on success, False on failure
+        """
+        url = f'{self.API_ENDPOINT}/core/items/{item_uuid}/mappedCollections'
+        collection_uri = f'{self.API_ENDPOINT}/core/collections/{collection_uuid}'
+        try:
+            r = self.api_post_uri(url, None, collection_uri)
+            if r.status_code == 204:
+                return True
+        except Exception as e:
+            logging.error(e)
+        return False
+
     def create_user(self, user, token=None):
         """
         Create a user
