@@ -16,6 +16,7 @@ better abstracting and handling of HAL-like API responses, plus just all the oth
 """
 import json
 import logging
+from pprint import pprint
 
 import requests
 from requests import Request
@@ -108,6 +109,7 @@ class DSpaceClient:
         self.auth_request_headers = {'User-Agent': self.USER_AGENT}
         self.request_headers = {'Content-type': 'application/json', 'User-Agent': self.USER_AGENT}
         self.list_request_headers = {'Content-type': 'text/uri-list', 'User-Agent': self.USER_AGENT}
+        self.form_request_headers = {'Content-type': 'application/x-www-form-urlencoded', 'User-Agent': self.USER_AGENT}
 
     def authenticate(self, retry=False):
         """
@@ -205,6 +207,33 @@ class DSpaceClient:
 
         return r
 
+    def api_post_empty(self, url, params, retry=False):
+        """
+        Perform an empty POST request. Refresh XSRF token if necessary. Uses auth_request_headers
+        because we don't want to set any explicit content type.
+        @param url:     DSpace REST API URL
+        @param params:  Any parameters to include (eg ?parent=abbc-....)
+        @param retry:   Has this method already been retried? Used if we need to refresh XSRF.
+        @return:        Response from API
+        """
+        r = self.session.post(url, data=None, params=params, headers=self.auth_request_headers)
+        self.update_token(r)
+
+        if r.status_code == 403:
+            # 403 Forbidden
+            # If we had a CSRF failure, retry the request with the updated token
+            # After speaking in #dev it seems that these do need occasional refreshes but I suspect
+            # it's happening too often for me, so check for accidentally triggering it
+            r_json = r.json()
+            if 'message' in r_json and 'CSRF token' in r_json['message']:
+                if retry:
+                    logging.warning(f'Too many retries updating token: {r.status_code}: {r.text}')
+                else:
+                    logging.debug("Retrying request with updated CSRF token")
+                    return self.api_post_uri(url, params=params, uri_list=uri_list, retry=True)
+
+        return r
+
     def api_post_uri(self, url, params, uri_list, retry=False):
         """
         Perform a POST request. Refresh XSRF token if necessary.
@@ -232,6 +261,26 @@ class DSpaceClient:
                     return self.api_post_uri(url, params=params, uri_list=uri_list, retry=True)
 
         return r
+
+    def api_post_form(self, url, params, form_data, retry=False):
+        r = self.session.post(url, data=form_data, params=params, headers=self.form_request_headers)
+        self.update_token(r)
+
+        if r.status_code == 403:
+            # 403 Forbidden
+            # If we had a CSRF failure, retry the request with the updated token
+            # After speaking in #dev it seems that these do need occasional refreshes but I suspect
+            # it's happening too often for me, so check for accidentally triggering it
+            r_json = r.json()
+            if 'message' in r_json and 'CSRF token' in r_json['message']:
+                if retry:
+                    logging.warning(f'Too many retries updating token: {r.status_code}: {r.text}')
+                else:
+                    logging.debug("Retrying request with updated CSRF token")
+                    return self.api_post_form(url, params=params, form_data=form_data, retry=True)
+
+        return r
+
 
     def api_put(self, url, params, json, retry=False):
         """
@@ -398,6 +447,54 @@ class DSpaceClient:
             logging.error(f'error parsing search result json {err}')
 
         return dsos
+
+    def search_raw_objects(self, query=None, scope=None, filters=None, page=0, size=20, sort=None, dso_type=None,
+                       configuration='default'):
+        """
+        Do a basic search with optional query, filters and dsoType params.
+        @param configuration: search configuration (e.g. 'default', 'workflow', 'workspace', 'persons') as defined in discovery.xml
+        @param query:   query string
+        @param scope:   uuid to limit search scope, eg. owning collection, parent community, etc.
+        @param filters: discovery filters as dict eg. {'f.entityType': 'Publication,equals', ... }
+        @param page: page number (not like 'start' as this is not row number, but page number of size {size})
+        @param size: size of page (aka. 'rows'), affects the page parameter above
+        @param sort: sort eg. 'title,asc'
+        @param dso_type: DSO type to further filter results
+        @return:        list of DspaceObject objects constructed from API resources
+        """
+        indexable_objects = []
+        if filters is None:
+            filters = {}
+        url = f'{self.API_ENDPOINT}/discover/search/objects'
+        # we will add params to filters, so
+        params = {}
+        if query is not None:
+            params['query'] = query
+        if scope is not None:
+            params['scope'] = scope
+        if dso_type is not None:
+            params['dsoType'] = dso_type
+        if size is not None:
+            params['size'] = size
+        if page is not None:
+            params['page'] = page
+        if sort is not None:
+            params['sort'] = sort
+        if configuration is not None:
+            params['configuration'] = configuration
+
+        r_json = self.fetch_resource(url=url, params={**params, **filters})
+
+        # instead lots of 'does this key exist, etc etc' checks, just go for it and wrap in a try?
+        try:
+            results = r_json['_embedded']['searchResult']['_embedded']['objects']
+            for result in results:
+                resource = result['_embedded']['indexableObject']
+                indexable_objects.append(resource)
+        except (TypeError, ValueError) as err:
+            logging.error(f'error parsing search result json {err}')
+
+        return indexable_objects
 
     def fetch_resource(self, url, params=None):
         """
@@ -1030,3 +1127,60 @@ class DSpaceClient:
         return self.solr.search(query, fq=filters, start=start, rows=rows, **{
             'fl': ','.join(fields)
         })
+
+    def find_pooled_task_uri_by_item(self, uuid=None):
+        url = (f'{self.API_ENDPOINT}/workflow/pooltasks/search/findByItem')
+        print(f'trying url={url} with uuid={uuid}')
+        res = parse_json(self.api_get(url, params={'uuid': uuid}))
+        if res is not None and res['_links'] is not None and res['_links']['self'] is not None:
+            return res['_links']['self']['href']
+        return None
+
+    def claim_pooled_task(self, uri):
+        url = (f'{self.API_ENDPOINT}/workflow/claimedtasks')
+        res = parse_json(self.api_post_uri(url, params=None, uri_list=uri))
+        return res
+
+    def get_item_for_workflow_item(self, resource):
+        if resource is not None:
+            item_uri = resource['_links']['item']['href']
+            if item_uri is not None:
+                # This item URI is read-only, so we'll return the true backing item instead
+                r = self.fetch_resource(item_uri)
+                if r is not None and 'uuid' in r:
+                    i = self.fetch_resource(r['_links']['self']['href'])
+                    return i
+
+    def approve_claimed_task(self, uri):
+        res = self.api_post_form(uri, params=None, form_data={'submit_approve': True})
+        pprint(res)
+        if res is not None and res.status_code == 204:
+            return True
+
+    # the below method just wraps the above 4 to achieve the whole process from an
+    # indexable Object search result resource, to archival
+    # Lots of assumptions here:
+    # - the current user is in the workflow pool
+    # - the workflow item is pooled, not already claimed, and there are no further steps (simple workflow)
+    # - everything else goes ok
+    # Use this as a prototype, and we can build it out with proper error checking, data modelling etc.
+    def claim_and_approve_workflow_item(self, resource):
+        if resource is not None and resource['type'] == 'workflowitem':
+            i = self.get_item_for_workflow_item(resource)
+            if i is not None:
+                # item is the backing object
+                pooled_task_uri = self.find_pooled_task_uri_by_item(i['uuid'])
+                print(pooled_task_uri)
+                if pooled_task_uri is not None:
+                    # claim
+                    claimed_task = self.claim_pooled_task(pooled_task_uri)
+                    pprint(claimed_task)
+                    if claimed_task is not None:
+                        r = self.approve_claimed_task(claimed_task['_links']['self']['href'])
+                        pprint(r)
+                        if r is True:
+                            # get the item again and return
+                            archived_item = Item(self.fetch_resource(i['_links']['self']['href']))
+                            return archived_item
+        # if we end up here, something went wrong
+        return None
