@@ -1153,7 +1153,6 @@ class DSpaceClient:
 
     def approve_claimed_task(self, uri):
         res = self.api_post_form(uri, params=None, form_data={'submit_approve': True})
-        pprint(res)
         if res is not None and res.status_code == 204:
             return True
 
@@ -1170,14 +1169,11 @@ class DSpaceClient:
             if i is not None:
                 # item is the backing object
                 pooled_task_uri = self.find_pooled_task_uri_by_item(i['uuid'])
-                print(pooled_task_uri)
                 if pooled_task_uri is not None:
                     # claim
                     claimed_task = self.claim_pooled_task(pooled_task_uri)
-                    pprint(claimed_task)
                     if claimed_task is not None:
                         r = self.approve_claimed_task(claimed_task['_links']['self']['href'])
-                        pprint(r)
                         if r is True:
                             # get the item again and return
                             archived_item = Item(self.fetch_resource(i['_links']['self']['href']))
